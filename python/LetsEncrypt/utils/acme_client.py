@@ -5,7 +5,7 @@ from urllib.request import urlopen
 
 PRODUCTION_CA = "https://acme-v01.api.letsencrypt.org"
 STAGING_CA = "https://acme-staging.api.letsencrypt.org"
-DEFAULT_CA = STAGING_CA
+DEFAULT_CA = PRODUCTION_CA
 
 # Let's Encrypt intermediate certificate
 INTERMEDIATE_CERT = """-----BEGIN CERTIFICATE-----

@@ -9,9 +9,9 @@ from urllib.request import urlopen
 
 from utils.waf_direct_api import BarracudaWAFAPI
 from utils.waf_acme import DomainVerifierBarracudaWAF, apply_certificate_to_waf_service, apply_certificates_to_waf_service_with_sni
-from utils.acme_client import ACMEClient, INTERMEDIATE_CERT, DEFAULT_CA
+from utils.acme_client import ACMEClient, INTERMEDIATE_CERT, DEFAULT_CA, STAGING_CA
 
-MAX_DOMAINS_PER_CERT = 3  # This is 100 for Let's Encryption production
+MAX_DOMAINS_PER_CERT = 100  # See https://letsencrypt.org/docs/rate-limits/
 
 LOGGER = logging
 logging.basicConfig(level=logging.DEBUG)
@@ -40,14 +40,14 @@ def main(argv):
     parser.add_argument("--waf-ssl-service", help="Service on WAF to upload resulting SSL certificate to")
 
     parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="Suppress output except for errors")
-    parser.add_argument("--ca", default=DEFAULT_CA, help="Certificate authority, default is Let's Encrypt")
+    parser.add_argument("--staging", action="store_true", help="Use staging instance of Let's Encrypt")
 
     args = parser.parse_args(argv)
     logging.getLogger().setLevel(args.quiet or logging.getLogger().level)
 
     waf_api = BarracudaWAFAPI(args.waf_netloc, args.waf_user, args.waf_password, args.waf_secure)
     verifier = DomainVerifierBarracudaWAF(waf_api, args.waf_service)
-    client = ACMEClient(args.account_key, verifier, logging, args.ca)
+    client = ACMEClient(args.account_key, verifier, logging, STAGING_CA if args.staging else DEFAULT_CA)
 
     if len(args.domains) <= MAX_DOMAINS_PER_CERT:
         # Get a single cert for all the domains and apply it to the WAF.
