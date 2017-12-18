@@ -73,6 +73,9 @@ class DomainVerifierBarracudaWAF:
 
     @contextlib.contextmanager
     def verify_domain(self, domain, token, path, file_contents):
+        # TODO: Check if the service is in passive mode.  If so, this won't work.  A possible workaround is to create
+        # a Content Rule that overrides the mode to active only for our path.
+
         # Create a response page that returns the verification contents
         # (Advanced->Libraries->Response Page in UI)
         response_page_name = 'LetsEncrypt-verification'
@@ -115,8 +118,43 @@ def apply_certificate_to_waf_service(waf_api, service_name, cert_name, private_k
     waf_api.upload_signed_certificate(cert_name, private_key, certificate, INTERMEDIATE_CERT)
 
     res = waf_api.basic_request_json('services/{}/ssl-security'.format(service_name))
-    res['data']['Test']['SSL Security']['certificate'] = cert_name
-    waf_api.basic_request_json('services/{}/ssl-security'.format(service_name), res['data']['Test']['SSL Security'], method='PUT')
+    ssl_data = res['data'][service_name]['SSL Security']
+    ssl_data['certificate'] = cert_name
+    waf_api.basic_request_json('services/{}/ssl-security'.format(service_name), ssl_data, method='PUT')
+
+def apply_certificates_to_waf_service_with_sni(waf_api, service_name, certificates):
+    """
+    Applies a set of certificates to a WAF service, with each certificate being used for its valid domains.
+    
+    :param waf_api: WAF API.
+    :param service_name: Name of the service to update certificates for.
+    :param certificates: A list of certificates.  Each certificate should be a dict with the following values:
+     * name - name of the certificate on the WAF
+     * cert - certificate text (PEM encoded)
+     * domains (optional) - list of domains this certificate covers.  If not provided, will be read from the certificate.
+    """
+
+    # The WAF accepts SNI as a list of domains and a list of certs, both of the same length.  Each domain will use
+    # the cert in the same index of the cert list.
+    domain_list = []
+    cert_list = []
+
+    for cert_dict in certificates:
+        if 'domains' not in cert_dict:
+            with ACMEClient.tempfile(cert_dict['cert']) as cert_file:
+                cert_dict['domains'] = ACMEClient.get_domains_from_cert(cert_file)
+
+        domain_list += cert_dict['domains']
+        cert_list += [cert_dict['cert_name']] * len(cert_dict['domains'])
+    assert len(domain_list) == len(cert_list)
+
+    res = waf_api.basic_request_json('services/{}/ssl-security'.format(service_name))
+    ssl_data = res['data'][service_name]['SSL Security']
+    ssl_data['enable-sni'] = 'Yes'
+    ssl_data['domain'] = domain_list
+    ssl_data['sni-certificate'] = cert_list
+    waf_api.basic_request_json('services/{}/ssl-security'.format(service_name), ssl_data, method='PUT')
+
 
 class ACMEClient:
     """
@@ -189,7 +227,35 @@ class ACMEClient:
         except IOError as e:
             return getattr(e, "code", None), getattr(e, "read", e.__str__)()
 
-    def get_domains_from_csr(self, csr_file):
+    @staticmethod
+    def _parse_domains_from_openssl_output(output):
+        domains = set([])
+        common_name = re.search(r"Subject:.*? CN\s?=\s?([^\s,;/]+)", output)
+        if common_name is not None:
+            domains.add(common_name.group(1))
+        subject_alt_names = re.search(r"X509v3 Subject Alternative Name: \n +([^\n]+)\n", output,
+                                      re.MULTILINE | re.DOTALL)
+        if subject_alt_names is not None:
+            for san in subject_alt_names.group(1).split(", "):
+                if san.startswith("DNS:"):
+                    domains.add(san[4:])
+
+        return domains
+
+    @staticmethod
+    def get_domains_from_cert(cert_file):
+        """
+        Inspects a certificate file and returns the set of domains from it (both the CN and any alternative names).
+        """
+        proc = subprocess.Popen(["openssl", "x509", "-in", cert_file, "-noout", "-text"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            raise IOError("Error loading {0}: {1}".format(cert_file, err))
+        return ACMEClient._parse_domains_from_openssl_output(out.decode('utf8'))
+
+    @staticmethod
+    def get_domains_from_csr(csr_file):
         """
         Inspects a CSR file and returns the set of domains from it (both the CN and any alternative names).
         """
@@ -199,18 +265,8 @@ class ACMEClient:
         out, err = proc.communicate()
         if proc.returncode != 0:
             raise IOError("Error loading {0}: {1}".format(csr, err))
-        domains = set([])
-        common_name = re.search(r"Subject:.*? CN\s?=\s?([^\s,;/]+)", out.decode('utf8'))
-        if common_name is not None:
-            domains.add(common_name.group(1))
-        subject_alt_names = re.search(r"X509v3 Subject Alternative Name: \n +([^\n]+)\n", out.decode('utf8'),
-                                      re.MULTILINE | re.DOTALL)
-        if subject_alt_names is not None:
-            for san in subject_alt_names.group(1).split(", "):
-                if san.startswith("DNS:"):
-                    domains.add(san[4:])
+        return ACMEClient._parse_domains_from_openssl_output(out.decode('utf8'))
 
-        return domains
 
     def register_account(self):
         if self.account_registered:
@@ -303,24 +359,22 @@ class ACMEClient:
         return """-----BEGIN CERTIFICATE-----\n{0}\n-----END CERTIFICATE-----\n""".format(
             "\n".join(textwrap.wrap(base64.b64encode(result).decode('utf8'), 64)))
 
-    def _tempfile(self, contents):
+    @staticmethod
+    @contextlib.contextmanager
+    def tempfile(contents):
         tmp_file_handle, tmp_filename = tempfile.mkstemp(text=True)
         tmp_file = os.fdopen(tmp_file_handle, 'w')
         tmp_file.write(contents)
         tmp_file.close()
-        return tmp_filename
+        try:
+            yield tmp_filename
+        finally:
+            os.remove(tmp_filename)
 
     def get_certificate_for_domains(self, domains, private_key_file, csr_file, cert_file):
         assert len(domains) > 0
 
-        # Create temporary OpenSSL config file
-        with open('openssl-csr-san-template.cnf', 'r') as f:
-            config_template = f.read()
-        config = config_template.format(domains[0], '#' if len(domains) == 1 else '',
-                                        '\n'.join('DNS.{}={}'.format(i + 1, d) for i, d in enumerate(domains[1:])))
-        config_filename = self._tempfile(config)
-
-        # Create private key
+        # Create private key if one doesn't already exist
         if not os.path.exists(private_key_file):
             self.log.info("Creating private key...")
             proc = subprocess.Popen(["openssl", "genrsa", "4096"],
@@ -331,17 +385,20 @@ class ACMEClient:
             with open(private_key_file, 'w') as f:
                 f.write(key.decode('latin-1'))
 
-        # Create CSR
-        proc = subprocess.Popen(
-            "openssl req -new -batch -sha256 -key {private_key_file} -out {csr_file} -config {config_filename}".format(
-                private_key_file=private_key_file, csr_file=csr_file, config_filename=config_filename),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate()
-        if proc.returncode != 0:
-            raise IOError("OpenSSL return error while creating CSR: {0}".format(err))
-
-        # Delete temp config
-        os.unlink(config_filename)
+        # Create temporary OpenSSL config file
+        with open('openssl-csr-san-template.cnf', 'r') as f:
+            config_template = f.read()
+        config = config_template.format(domains[0], '#' if len(domains) == 1 else '',
+                                        '\n'.join('DNS.{}={}'.format(i + 1, d) for i, d in enumerate(domains[1:])))
+        with self.tempfile(config) as config_filename:
+            # Create CSR
+            proc = subprocess.Popen(
+                "openssl req -new -batch -sha256 -key {private_key_file} -out {csr_file} -config {config_filename}".format(
+                    private_key_file=private_key_file, csr_file=csr_file, config_filename=config_filename),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if proc.returncode != 0:
+                raise IOError("OpenSSL return error while creating CSR: {0}".format(err))
 
         # Get certificate
         cert = self.get_certificate_from_csr(csr_file)
@@ -376,23 +433,7 @@ class ACMEClient:
 
 
 def main(argv):
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent("""\
-            This script automates the process of getting a signed TLS certificate from
-            Let's Encrypt using the ACME protocol. It will need to be run on your server
-            and have access to your private account key, so PLEASE READ THROUGH IT! It's
-            only ~200 lines, so it won't take long.
-
-            ===Example Usage===
-            python acme_tiny.py --account-key ./account.key --csr ./domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > signed.crt
-            ===================
-
-            ===Example Crontab Renewal (once per month)===
-            0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed.crt 2>> /var/log/acme_tiny.log
-            ==============================================
-            """)
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("-k", "--account-key", required=True, help="Path to your Let's Encrypt account private key")
     parser.add_argument("-w", "--waf-netloc", required=True, help="WAF netloc, in the format <host>[:<port>]")
     parser.add_argument("-S", "--waf-secure", action='store_true', default=False, help="Connect to WAF using HTTPS")
