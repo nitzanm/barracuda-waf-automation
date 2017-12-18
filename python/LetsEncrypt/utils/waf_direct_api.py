@@ -5,7 +5,7 @@ import json
 import requests
 from requests.auth import HTTPBasicAuth
 
-from waf_api_errors import *
+from .waf_api_errors import *
 import logging
 
 

@@ -1,24 +1,11 @@
 #!/usr/bin/env python
-"""
-Allows you to obtain certificates from Let's Encrypt (https://letsencrypt.org/) for domains hosted on a Barracuda
-Web Application Firewall.  Automatically answers Let's Encrypt's challenges using the Web Application Firewall.
-"""
 import argparse, subprocess, json, os, sys, base64, binascii, time, hashlib, re, copy, textwrap, logging
 import pprint, tempfile, contextlib
-
-from waf_direct_api import BarracudaWAFAPI
-try:
-    from urllib.request import urlopen # Python 3
-except ImportError:
-    from urllib2 import urlopen # Python 2
-
+from urllib.request import urlopen
 
 PRODUCTION_CA = "https://acme-v01.api.letsencrypt.org"
 STAGING_CA = "https://acme-staging.api.letsencrypt.org"
 DEFAULT_CA = STAGING_CA
-
-LOGGER = logging
-logging.basicConfig(level=logging.DEBUG)
 
 # Let's Encrypt intermediate certificate
 INTERMEDIATE_CERT = """-----BEGIN CERTIFICATE-----
@@ -66,100 +53,11 @@ class DomainVerifierFile:
         os.remove(wellknown_path)
 
 
-class DomainVerifierBarracudaWAF:
-    def __init__(self, waf_api, service_name):
-        self.waf_api = waf_api
-        self.service_name = service_name
-
-    @contextlib.contextmanager
-    def verify_domain(self, domain, token, path, file_contents):
-        # TODO: Check if the service is in passive mode.  If so, this won't work.  A possible workaround is to create
-        # a Content Rule that overrides the mode to active only for our path.
-
-        # Create a response page that returns the verification contents
-        # (Advanced->Libraries->Response Page in UI)
-        response_page_name = 'LetsEncrypt-verification'
-        response_page = {
-            'body': file_contents,
-            'headers': ['Connection:Close &lt;br&gt;Content-Type:text/plain'],
-            'name': response_page_name,
-            'status-code': '200 OK',
-            'type': 'Other Pages'}
-        self.waf_api.create_or_update_object('response-pages', response_page_name, response_page)
-
-        # Create an Allow/Deny rule that responds with this page when the verification path is requested
-        # (Websites->Allow/Deny in UI)
-        acl_name = 'LetsEncrypt-verification'
-        acl = {'action': 'Deny and Log',
-           'comments': '',
-           'deny-response': 'Response Page',
-           'enable': 'On',
-           'extended-match': '*',
-           'extended-match-sequence': '1',
-           'follow-up-action': 'None',
-           'follow-up-action-time': '60',
-           'host': '*',
-           'name': acl_name,
-           'redirect-url': '',
-           'response-page': response_page_name,
-           'url': path}
-        self.waf_api.create_or_update_object('services/{}/url-acls'.format(self.service_name), acl_name, acl)
-
-        yield
-
-        self.waf_api.basic_request_json('services/{}/url-acls/{}'.format(self.service_name, acl_name), method='DELETE')
-        self.waf_api.basic_request_json('response-pages/' + response_page_name, method='DELETE')
-
-
-def apply_certificate_to_waf_service(waf_api, service_name, cert_name, private_key_file, certificate):
-    with open(private_key_file, 'r') as f:
-        private_key = f.read()
-
-    waf_api.upload_signed_certificate(cert_name, private_key, certificate, INTERMEDIATE_CERT)
-
-    res = waf_api.basic_request_json('services/{}/ssl-security'.format(service_name))
-    ssl_data = res['data'][service_name]['SSL Security']
-    ssl_data['certificate'] = cert_name
-    waf_api.basic_request_json('services/{}/ssl-security'.format(service_name), ssl_data, method='PUT')
-
-def apply_certificates_to_waf_service_with_sni(waf_api, service_name, certificates):
-    """
-    Applies a set of certificates to a WAF service, with each certificate being used for its valid domains.
-    
-    :param waf_api: WAF API.
-    :param service_name: Name of the service to update certificates for.
-    :param certificates: A list of certificates.  Each certificate should be a dict with the following values:
-     * name - name of the certificate on the WAF
-     * cert - certificate text (PEM encoded)
-     * domains (optional) - list of domains this certificate covers.  If not provided, will be read from the certificate.
-    """
-
-    # The WAF accepts SNI as a list of domains and a list of certs, both of the same length.  Each domain will use
-    # the cert in the same index of the cert list.
-    domain_list = []
-    cert_list = []
-
-    for cert_dict in certificates:
-        if 'domains' not in cert_dict:
-            with ACMEClient.tempfile(cert_dict['cert']) as cert_file:
-                cert_dict['domains'] = ACMEClient.get_domains_from_cert(cert_file)
-
-        domain_list += cert_dict['domains']
-        cert_list += [cert_dict['cert_name']] * len(cert_dict['domains'])
-    assert len(domain_list) == len(cert_list)
-
-    res = waf_api.basic_request_json('services/{}/ssl-security'.format(service_name))
-    ssl_data = res['data'][service_name]['SSL Security']
-    ssl_data['enable-sni'] = 'Yes'
-    ssl_data['domain'] = domain_list
-    ssl_data['sni-certificate'] = cert_list
-    waf_api.basic_request_json('services/{}/ssl-security'.format(service_name), ssl_data, method='PUT')
-
-
 class ACMEClient:
     """
     Forked from https://github.com/diafygi/acme-tiny .
     """
+
     def __init__(self, account_key, domain_verifier, log=logging, CA=DEFAULT_CA):
         self.domain_verifier = domain_verifier
         self.log = log
@@ -213,7 +111,7 @@ class ACMEClient:
         protected["nonce"] = urlopen(self.CA + "/directory").headers['Replay-Nonce']
         protected64 = self._b64(json.dumps(protected).encode('utf8'))
         proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", self.account_key],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = proc.communicate("{0}.{1}".format(protected64, payload64).encode('utf8'))
         if proc.returncode != 0:
             raise IOError("OpenSSL Error: {0}".format(err))
@@ -259,14 +157,13 @@ class ACMEClient:
         """
         Inspects a CSR file and returns the set of domains from it (both the CN and any alternative names).
         """
-        self.log.info("Parsing CSR...")
+        logging.info("Parsing CSR...")
         proc = subprocess.Popen(["openssl", "req", "-in", csr_file, "-noout", "-text"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = proc.communicate()
         if proc.returncode != 0:
             raise IOError("Error loading {0}: {1}".format(csr, err))
         return ACMEClient._parse_domains_from_openssl_output(out.decode('utf8'))
-
 
     def register_account(self):
         if self.account_registered:
@@ -298,8 +195,8 @@ class ACMEClient:
         result_json = json.loads(result.decode('utf8'))
 
         # Have we already completed this challenge?
-        #if result_json['status'] == 'valid':
-        #    return
+        if result_json['status'] == 'valid':
+            return
 
         challenge = next(c for c in result_json['challenges'] if c['type'] == "http-01")
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
@@ -345,7 +242,7 @@ class ACMEClient:
     def sign_csr(self, csr_file):
         self.log.info("Signing certificate...")
         proc = subprocess.Popen(["openssl", "req", "-in", csr_file, "-outform", "DER"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         csr_der, err = proc.communicate()
         code, result = self._send_signed_request(self.CA + "/acme/new-cert", {
             "resource": "new-cert",
@@ -363,9 +260,12 @@ class ACMEClient:
     @contextlib.contextmanager
     def tempfile(contents):
         tmp_file_handle, tmp_filename = tempfile.mkstemp(text=True)
-        tmp_file = os.fdopen(tmp_file_handle, 'w')
-        tmp_file.write(contents)
-        tmp_file.close()
+        if contents:
+            tmp_file = os.fdopen(tmp_file_handle, 'w')
+            tmp_file.write(contents)
+            tmp_file.close()
+        else:
+            os.close(tmp_file_handle)
         try:
             yield tmp_filename
         finally:
@@ -409,7 +309,6 @@ class ACMEClient:
 
         return cert
 
-
     def get_certificate_from_csr(self, csr_file):
         domains = self.get_domains_from_csr(csr_file)
         self.register_account()
@@ -430,38 +329,3 @@ class ACMEClient:
         if not serial_number:
             raise IOError("Canot parse serial number from {}".format(cert_file))
         return serial_number.group(1).replace(':', '')
-
-
-def main(argv):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-k", "--account-key", required=True, help="Path to your Let's Encrypt account private key")
-    parser.add_argument("-w", "--waf-netloc", required=True, help="WAF netloc, in the format <host>[:<port>]")
-    parser.add_argument("-S", "--waf-secure", action='store_true', default=False, help="Connect to WAF using HTTPS")
-    parser.add_argument("-u", "--waf-user", required=True, help="Login username to your WAF")
-    parser.add_argument("-p", "--waf-password", required=True, help="Login password to your WAF")
-    parser.add_argument("-s", "--waf-service", required=True, help="Service on your WAF to verify with")
-    parser.add_argument("-d", "--domains", nargs="+", required=True, help="List of domain(s) to verify")
-    parser.add_argument("--private-key-file", default="domain.key", help="File in which to place/read private key for cert")
-    parser.add_argument("--csr-file", default="domain.csr", help="File in which to place CSR")
-    parser.add_argument("--cert-file", default="domain.crt", help="File in which to place signed certificate")
-    parser.add_argument("--waf-ssl-service", help="Service on WAF to upload resulting SSL certificate to")
-
-    parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="Suppress output except for errors")
-    parser.add_argument("--ca", default=DEFAULT_CA, help="Certificate authority, default is Let's Encrypt")
-
-    args = parser.parse_args(argv)
-    logging.getLogger().setLevel(args.quiet or logging.getLogger().level)
-
-    waf_api = BarracudaWAFAPI(args.waf_netloc, args.waf_user, args.waf_password, args.waf_secure)
-    verifier = DomainVerifierBarracudaWAF(waf_api, args.waf_service)
-
-    client = ACMEClient(args.account_key, verifier, logging, args.ca)
-    certificate = client.get_certificate_for_domains(args.domains, args.private_key_file, args.csr_file, args.cert_file)
-
-    if args.waf_ssl_service:
-        serial_number = client.get_serial_number_from_certificate(args.cert_file)
-        apply_certificate_to_waf_service(waf_api, args.waf_ssl_service, serial_number, args.private_key_file, certificate)
-
-
-if __name__ == "__main__": # pragma: no cover
-    main(sys.argv[1:])
